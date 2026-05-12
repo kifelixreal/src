@@ -1,0 +1,28 @@
+/**:
+  ros__parameters:
+    wheel_radius: 0.082
+    wheel_base: 0.31
+
+    # Frames e tópicos são RELATIVOS — o namespace do nó (ex: robot1, robot2)
+    # é prefixado automaticamente pelo ROS2. Não use barra inicial aqui.
+    odom_frame: "odom"
+    base_frame: "base_link"
+
+    odom_topic: "wheel/odom"
+    cmd_vel_topic: "cmd_vel"
+    drive_status_topic: "ui/drive_status"
+
+    hz: 30.0
+    publish_tf: false
+    cmd_timeout: 0.5
+
+    can_channel: "can0"
+    # Caminho do DBC. NORMALMENTE este valor é sobrescrito pelo launch
+    # com o caminho do share do pacote instalado (via get_package_share_directory),
+    # ou seja: <install_prefix>/share/mjv_robot_fleet_base_teste/odrive-cansimple.dbc
+    # Este default só é usado se alguém carregar o YAML sem passar pelo launch.
+    # Ajuste se o seu workspace na Jetson tiver outro nome.
+    can_dbc: "/home/mjv/ros2_ws/src/mjv_robot_fleet_base_teste/odrive-cansimple.dbc"
+
+    right_id: 0
+    left_id: 1

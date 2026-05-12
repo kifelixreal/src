@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mjv_nav_controller_padrao</name>
+  <version>0.1.0</version>
+  <description>Navigation stack: orchestrator, local arbiter, controller and VFH, plus a Nav2 bringup launch.</description>
+
+  <maintainer email="you@example.com">Tatiana</maintainer>
+  <license>MIT</license>
+
+  <!-- build -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- runtime / exec deps -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- msgs / tf -->
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- sua action ExecutePath -->
+  <exec_depend>mjv_robot_interfaces</exec_depend>
+
+  <!-- Nav2 nodes usados no launch -->
+  <exec_depend>nav2_planner</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+
+  <!-- (opcional) se usar nav2_msgs::ComputePathToPose em clientes -->
+  <exec_depend>nav2_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
