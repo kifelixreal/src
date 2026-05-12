@@ -1,0 +1,764 @@
+================================================================================
+RELATÓRIO TÉCNICO — ESCALABILIDADE MULTI-ROBÔ
+Projeto: MJV Robot Fleet (ROS 2 Humble / Ubuntu 22.04)
+Data: 12 de Maio de 2026
+Autor: Arthur (estagiário) — assistido por ferramenta de IA (Blackbox CLI)
+Workspace de produção: /home/arthur/MJV_robot2/
+Workspace de desenvolvimento: /home/arthur/src/
+================================================================================
+
+
+1. OBJETIVO DA TAREFA
+--------------------------------------------------------------------------------
+Tornar o stack ROS 2 do robô autônomo MJV escalável para operação de
+múltiplos robôs separadamente no mesmo ambiente físico, mantendo o
+isolamento de tópicos, frames TF e nós entre cada robô da frota.
+
+Escopo de modificação restrito a 4 pacotes (versões "_teste"):
+  - mjv_robot_fleet_base_teste
+  - mjv_robot_fleet_sensors_teste
+  - mjv_robot_fleet_localization_teste
+  - mjv_robot_fleet_navigation_teste
+
+Pacotes com permissão apenas de LEITURA (não modificados):
+  - mjv_robot_fleet_base, _sensors, _localization, _navigation (originais)
+  - mjv_robot_interfaces
+  - mjv_robot_pkg_with_actions
+  - mjv_ui_bridge
+  - mjv_nav_controller_padrao
+  - sllidar_ros2
+  - zed-ros2-wrapper
+
+
+2. ANÁLISE INICIAL DO PROJETO
+--------------------------------------------------------------------------------
+2.1. Arquitetura ROS 2 do robô:
+  - BASE: controle diferencial via ODrive (CAN ou USB), publica wheel/odom
+    e consome cmd_vel. Nós: odom_node, odom_node_copy, odom_node_usb.
+  - SENSORES: câmera ZED2 (zed-ros2-wrapper) + RPLidar (sllidar_ros2),
+    com TFs estáticas base_link → laser, base_link → zed_camera_link, etc.
+  - LOCALIZAÇÃO: EKF (robot_localization) fundindo wheel/odom + zed/odom
+    + zed/imu, AMCL (nav2_amcl) + map_server, e localization_manager
+    (rotina de boot que tenta checkpoint e dispara movimentos de
+    convergência: spin 360° + vai-e-volta).
+  - NAVEGAÇÃO: Nav2 stack (controller_server com MPPIController,
+    planner_server com SmacPlanner2D, bt_navigator, behavior_server) +
+    mission_orchestrator (DSL JSON com Speak/GoTo/Tour/Wait/AwaitCommand/
+    ReturnHome) + teleop_relay com watchdog.
+
+2.2. Estado inicial dos pacotes "_teste" (já parcialmente trabalhados pelo
+     usuário antes desta tarefa):
+  - Já tinham `namespace` declarado nos launches, mas com hardcode "robot2".
+  - Frames TF, tópicos absolutos (/cmd_vel, /plan, /ui/...), e chaves
+    YAML como `robot2:` ainda apareciam hardcoded em vários arquivos.
+  - localization.launch.py do _teste apontava para o pacote ORIGINAL
+    (mjv_robot_fleet_localization), não para o _teste — bug latente.
+  - mission_orchestrator com path absoluto antigo do missions.json
+    (/home/mjv/ros2_ws/...).
+
+2.3. Decisões arquiteturais aprovadas pelo usuário antes da implementação:
+  (1) Nomenclatura: padrão numérico robot1, robot2, robot3, ...
+      Default mantido em "robot2" para preservar fluxo atual.
+  (2) Map server COMPARTILHADO entre robôs (1 instância, fora de namespace).
+      AMCL fica dentro do namespace de cada robô.
+  (3) Cenário de hardware: cada robô tem sua própria Jetson com seus
+      próprios periféricos (CAN, USB do LiDAR). Defaults `can0` e
+      `/dev/ttyUSB0` servem para todos.
+  (4) Namespace é argumento overrideável, com default "robot2".
+  (5) Compatibilidade legacy não é exigida — pacotes _teste sempre rodam
+      com namespace.
+
+
+3. ESTRATÉGIA DE ESCALABILIDADE
+--------------------------------------------------------------------------------
+3.1. Princípios aplicados:
+  (a) Namespace por robô prefixa todos os nós, tópicos e actions.
+  (b) TF prefix por robô: cada robô tem sua própria árvore TF
+      (robotN/odom, robotN/base_link, robotN/laser, robotN/zed_camera_link,
+      robotN/zed_imu_link). Apenas o frame "map" é global compartilhado.
+  (c) Tópicos RELATIVOS no código Python (sem barra inicial) — assim o
+      runtime do ROS 2 prefixa automaticamente com o namespace do nó.
+  (d) YAMLs com chave wildcard `/**:` para aceitar qualquer nome de nó,
+      independente do namespace em que ele rode.
+  (e) Substituição de frames em runtime via PyYAML (decisão de não
+      depender de nav2_common.launch.RewrittenYaml — ver seção 6).
+  (f) Map server compartilhado, controlado por argumento `share_map`.
+
+
+4. MUDANÇAS REALIZADAS POR PACOTE
+--------------------------------------------------------------------------------
+
+4.1. mjv_robot_fleet_base_teste
+  Arquivos modificados:
+    - config/robot_default.yaml
+    - launch/bringup_base.launch.py
+    - launch/bringup_base_usb.launch.py
+
+  Detalhes:
+    - YAML reescrito com chave raiz "/**" (wildcard de nó).
+    - Removido prefixo "robot2/" dos campos: odom_frame, base_frame,
+      odom_topic, cmd_vel_topic, drive_status_topic. Todos passaram a
+      ser RELATIVOS (ex: "odom" em vez de "robot2/odom").
+    - bringup_base.launch.py renomeado para usar nome de nó "odom_node"
+      (era "odom_node_copy"); continua usando o EXECUTABLE odom_node_copy.
+    - Frames TF (odom_frame, base_frame) agora são INJETADOS pelo launch
+      via substituição de LaunchConfiguration:
+          odom_frame = [namespace, "/odom"]
+          base_frame = [namespace, "/base_link"]
+    - Argumentos do launch declarados com descrições e defaults:
+          namespace (default robot2)
+          params_file (default share/.../config/robot_default.yaml)
+          can_channel (default can0)
+          dbc_file (default share/.../odrive-cansimple.dbc)
+
+4.2. mjv_robot_fleet_sensors_teste
+  Arquivos modificados:
+    - config/sensors_default.yaml
+    - launch/sensors.launch.py
+
+  Detalhes:
+    - YAML reescrito com chave raiz "/**".
+    - Removidos campos parent_frame e child_frame do YAML (eram
+      hardcoded com "robot2/..."). Sobrou apenas xyz/rpy de offset
+      físico — o resto é calculado no launch.
+    - sensors.launch.py: frames TF dos static_transform_publisher agora
+      são SUBSTITUTIONS construídas em runtime:
+          base_link_frame = [namespace, "/base_link"]
+          laser_frame = [namespace, "/laser"]
+          zed_cam_frame = [namespace, "/zed_camera_link"]
+          zed_imu_frame = [namespace, "/zed_imu_link"]
+    - frame_id do RPLidar passou a ser substitution dinâmica (era
+      string hardcoded "robot2/laser").
+    - Adicionado argumento `lidar_serial_port` (default /dev/ttyUSB0)
+      como configurável via linha de comando.
+
+4.3. mjv_robot_fleet_localization_teste
+  Arquivos modificados:
+    - config/ekf.yaml
+    - config/amcl_nav2.yaml
+    - launch/amcl_loc.launch.py
+    - launch/localization.launch.py
+
+  Detalhes:
+    - ekf.yaml e amcl_nav2.yaml reescritos com chave raiz "/**".
+    - Frames (world_frame, odom_frame, base_link_frame no EKF;
+      odom_frame_id, base_frame_id, global_frame_id no AMCL) são
+      deixados SEM prefixo no YAML e SOBRESCRITOS em runtime pelo launch.
+    - scan_topic do AMCL passou de "robot2/scan" (absoluto) para "scan"
+      (relativo). Como o AMCL roda dentro do namespace, vira
+      automaticamente robotN/scan.
+    - amcl_loc.launch.py:
+        * Usa OpaqueFunction + PyYAML para gerar arquivo temporário em
+          /tmp com frames já prefixados.
+        * Adicionado argumento `share_map` (default true). Quando true,
+          sobe o map_server e seu lifecycle_manager FORA do namespace
+          dos robôs (compartilhado). Quando false, AMCL é subido sem
+          duplicar o map_server.
+        * Lifecycle manager do AMCL fica DENTRO do namespace.
+    - localization.launch.py:
+        * Reescrito para usar OpaqueFunction + PyYAML para reescrever
+          o YAML do EKF com frames prefixados.
+        * BUG CORRIGIDO: o nó localization_manager passou a apontar
+          para o pacote `mjv_robot_fleet_localization_teste` (antes
+          estava apontando erroneamente para o pacote ORIGINAL).
+        * Argumento `share_map` é repassado para amcl_loc.launch.py.
+        * Argumento `last_pose_path` mantido único; recomendação no
+          docstring de cada robô usar /home/arthur/.mjv/<ns>/last_pose.yaml
+          para evitar colisão.
+    - localization_manager.py NÃO precisou ser modificado: já usava
+      tópicos RELATIVOS via parâmetros declarados (cmd_vel_topic,
+      initialpose_topic, amcl_pose_topic, reinit_service).
+
+4.4. mjv_robot_fleet_navigation_teste
+  Arquivos modificados:
+    - config/nav2_params.yaml
+    - launch/navigation.launch.py
+    - mjv_robot_fleet_navigation_teste/mission_orchestrator.py
+    - mjv_robot_fleet_navigation_teste/teleop_relay.py
+    - mjv_robot_fleet_navigation_teste/waypoint_mission_node.py
+
+  Detalhes do nav2_params.yaml:
+    - YAML reestruturado com TODOS os parâmetros aninhados sob "/**:".
+    - Removidos hardcodes "robot2/base_link" de:
+        controller_server.robot_base_frame
+        global_costmap.global_costmap.robot_base_frame
+        local_costmap.local_costmap.robot_base_frame
+        bt_navigator.robot_base_frame
+        behavior_server.robot_base_frame
+    - Removido "robot2/odom" de local_costmap.local_costmap.global_frame.
+      Substituído por placeholder "<NAMESPACE>/odom" (substituição em
+      runtime via text replace).
+    - Removido "robot2/scan" de obstacle_layer.scan.topic. Substituído
+      por "scan" e reescrito em runtime pelo launch.
+    - REMOVIDO COMPLETAMENTE o nó lifecycle_manager_navigation do YAML.
+      Justificativa: o nav2_bringup já cria seu próprio lifecycle
+      manager dentro do namespace, ter dois lifecycle managers no mesmo
+      namespace causa conflito de gerenciamento.
+
+  Detalhes do navigation.launch.py:
+    - Reescrito do zero usando OpaqueFunction + PyYAML.
+    - Pipeline de processamento do YAML:
+        (1) Lê o nav2_params.yaml original.
+        (2) Faz text replace de "<NAMESPACE>" pelo namespace real
+            (cobre o local_costmap.global_frame).
+        (3) Reparse com PyYAML e walk recursivo no dict para reescrever
+            todas as ocorrências de "robot_base_frame" para
+            "<ns>/base_link" e todas as ocorrências de
+            obstacle_layer.scan.topic para "<ns>/scan".
+        (4) Grava arquivo temporário em /tmp/nav2_<ns>_<rand>.yaml.
+        (5) Passa esse arquivo para o nav2_bringup via include.
+    - Mission Orchestrator e Teleop Relay são instanciados dentro do
+      namespace, com parâmetros explícitos (plan_topic, navigate_action,
+      base_link_frame, missions_file, etc).
+    - Argumentos do launch:
+        namespace (default robot2)
+        use_sim_time (default false)
+        params_file (default share/.../config/nav2_params.yaml)
+        missions_file (default share/.../config/missions.json)
+
+  Detalhes do mission_orchestrator.py:
+    - Convertidos para parâmetros RELATIVOS:
+        navigate_action: "/navigate_to_pose" -> "navigate_to_pose"
+        plan_topic: "/plan" -> "plan"
+        ui_start_mission_topic: nova chave (default "ui/start_mission")
+        ui_mission_ctrl_topic: nova chave (default "mission_ctrl")
+        ui_progress_topic: nova chave (default "ui/progress")
+        tts_topic: nova chave (default "tts/say")
+    - Removidos hardcodes:
+        create_subscription(String, "/ui/start_mission", ...)
+        create_subscription(String, "/mission_ctrl", ...)
+        create_publisher(String, "/ui/progress", ...)
+        create_publisher(String, "/tts/say", ...)
+      Todos passaram a ler o nome do tópico do parâmetro.
+    - missions_file:
+        Default antigo: /home/mjv/ros2_ws/src/mjv_robot_fleet_navigation/config/missions.json
+        Default novo: "" (vazio); o launch sempre passa o caminho do
+        share do pacote _teste (default robusto).
+        Se vazio, log de warning + missions = {} (não crasha).
+
+  Detalhes do teleop_relay.py:
+    - Reescrito de forma mais limpa com parâmetros configuráveis:
+        cmd_vel_topic (default "cmd_vel", relativo)
+        manual_cmd_topic (default "ui/manual_cmd", relativo)
+        watchdog_timeout (mantido em 0.5s)
+
+  Detalhes do waypoint_mission_node.py:
+    - Mudado "/amcl_pose" para "amcl_pose" (relativo).
+
+
+5. PROCESSO DE VERIFICAÇÃO E TESTES
+--------------------------------------------------------------------------------
+
+5.1. Build (colcon)
+  Comando:
+    cd /home/arthur/src && colcon build --packages-select \
+      mjv_robot_fleet_base_teste mjv_robot_fleet_sensors_teste \
+      mjv_robot_fleet_localization_teste mjv_robot_fleet_navigation_teste \
+      --symlink-install
+
+  Resultado: 4 pacotes finished sem erros (~2.0s tempo total).
+
+5.2. Validação dos launch files (ros2 launch ... --show-args)
+  Comando:
+    source /opt/ros/humble/setup.bash
+    cd /home/arthur/src && source install/setup.bash
+    ros2 launch mjv_robot_fleet_base_teste bringup_base.launch.py --show-args
+
+  Resultado:
+    OK — argumentos `namespace`, `params_file`, `can_channel`, `dbc_file`
+    listados com defaults corretos.
+
+  Para sensors.launch.py:
+    OK quando workspace MJV_robot2/install foi sourceado (zed_wrapper
+    está lá). No /home/arthur/src isolado falhou apenas por dependência
+    ausente (zed_wrapper não instalado), o que é esperado.
+
+  Para localization.launch.py e navigation.launch.py (1ª tentativa):
+    FALHA — ModuleNotFoundError: No module named 'nav2_common'
+
+  Resolução: ver seção 6.
+
+5.3. Verificação estática (greps)
+  Hardcodes "robot2" remanescentes nos 4 pacotes:
+    Apenas em (a) defaults de DeclareLaunchArgument (intencional),
+    (b) docstrings/comentários explicativos. Zero ocorrências em
+    valores funcionais (frames TF, tópicos, nomes de parâmetros).
+
+  Tópicos absolutos remanescentes em código Python:
+    Zero ocorrências de create_publisher/subscription/client com
+    string começando por "/" nos 4 pacotes.
+
+  Conferência das chaves YAML:
+    Sem prefixos "robot1/" ou "robot2/" hardcoded em arquivos
+    funcionais (apenas em comentários explicativos).
+
+5.4. Validação da substituição em runtime (script Python ad-hoc)
+  Script executado para chamar a função _materialize_nav2_yaml do
+  navigation.launch.py com namespace="robot2" e validar o YAML gerado:
+
+    Generated: /tmp/nav2_robot2_kdlvbozq.yaml
+    controller_server.robot_base_frame = None  (esperado, não tem campo)
+    global_costmap.global_costmap.robot_base_frame = robot2/base_link  ✓
+    global_costmap.global_costmap.global_frame = map  ✓ (compartilhado)
+    local_costmap.local_costmap.robot_base_frame = robot2/base_link  ✓
+    local_costmap.local_costmap.global_frame = robot2/odom  ✓
+    local_costmap.obstacle_layer.scan.topic = robot2/scan  ✓
+    bt_navigator.robot_base_frame = robot2/base_link  ✓
+    bt_navigator.global_frame = map  ✓
+    behavior_server.robot_base_frame = robot2/base_link  ✓
+    behavior_server.global_frame = map  ✓
+
+  Conclusão: a substituição funciona corretamente — frames de chassi
+  ficam prefixados, frame global "map" continua compartilhado.
+
+
+6. PROBLEMAS ENCONTRADOS E SOLUÇÕES APLICADAS
+--------------------------------------------------------------------------------
+
+6.1. Erro: Module 'nav2_common' não encontrado
+  Sintoma:
+    ModuleNotFoundError: No module named 'nav2_common'
+    ao executar `ros2 launch mjv_robot_fleet_localization_teste
+    localization.launch.py --show-args`.
+
+  Causa:
+    A versão inicial dos launches usava `from nav2_common.launch import
+    RewrittenYaml` para reescrever YAMLs em runtime. O pacote
+    ros-humble-nav2-common não está instalado nesta máquina (verificado
+    com `apt list --installed | grep nav2-common` e `find /opt/ros/humble
+    -name nav2_common`).
+
+  Solução adotada:
+    Refatorar os 3 launches (amcl_loc, localization, navigation) para
+    usar PyYAML diretamente em vez de RewrittenYaml. Implementadas
+    funções _materialize_*_yaml que:
+      - Leem o YAML original.
+      - Modificam in-memory as chaves de frame.
+      - Gravam um arquivo temporário em /tmp.
+      - Retornam o caminho do arquivo temp para ser usado pelo nó.
+    Vantagens:
+      - Sem dependência externa adicional.
+      - Substituições mais previsíveis (apenas onde queremos).
+      - Funciona em qualquer ambiente com ROS 2 + PyYAML (sempre presente).
+
+6.2. Problema: RewrittenYaml aplicaria substituições em todos os lugares
+  Antes da decisão de não usar RewrittenYaml, foi identificado um
+  problema conceitual: a chave `global_frame` aparece em vários nós do
+  Nav2 — em `bt_navigator` e `behavior_server` deve ser "map", mas em
+  `local_costmap` deve ser "robotN/odom". RewrittenYaml sobrescreveria
+  TODAS as ocorrências da chave com o mesmo valor.
+
+  Solução adotada:
+    - Para o local_costmap: usar placeholder "<NAMESPACE>/odom" no
+      YAML, substituído por text replace antes do parse.
+    - Para os demais (que devem permanecer "map"): deixar literal "map"
+      no YAML.
+    - Walk recursivo em PyYAML cuida de robot_base_frame (que SEMPRE
+      vira <ns>/base_link) e do scan.topic.
+
+6.3. Workspace de produção diferente do diretório de trabalho
+  Identificado durante a fase de testes que:
+    - PROJECT ROOT do contexto: /home/arthur/src/
+    - Workspace ROS 2 efetivo do estágio: /home/arthur/MJV_robot2/
+  Ambos contêm pacotes com o MESMO nome, mas com conteúdos divergentes
+  (devido a histórico de cópias manuais).
+
+  Resolução:
+    - Todas as edições foram feitas em /home/arthur/src/ conforme o
+      PROJECT ROOT informado.
+    - Após validação completa (build + smoke test), os 4 pacotes
+      foram COPIADOS para /home/arthur/MJV_robot2/src/, com backup
+      automático dos pacotes antigos sob sufixo
+      `.bak_20260512_relatorio` para permitir rollback se necessário.
+
+
+7. ALERTAS IMPORTANTES PARA O USUÁRIO
+--------------------------------------------------------------------------------
+
+ALERTA 1: Mudança no contrato com a UI (mjv_ui_bridge / mjv-ui)
+  Os tópicos do mission_orchestrator que antes eram absolutos:
+      /ui/start_mission
+      /mission_ctrl
+      /ui/progress
+      /tts/say
+  agora são relativos e ficam dentro do namespace do robô. Para
+  controlar o robot2, a UI precisa publicar/subscrever em:
+      /robot2/ui/start_mission
+      /robot2/mission_ctrl
+      /robot2/ui/progress
+      /robot2/tts/say
+  AÇÃO NECESSÁRIA: ajustar a UI (mjv-ui ou mjv_ui_bridge) para
+  contemplar o namespace do robô. Recomenda-se que a UI tenha um
+  parâmetro/dropdown para selecionar com qual robô conversar.
+
+ALERTA 2: Map server compartilhado — convenção de subida
+  O argumento `share_map` controla se o map_server é instanciado.
+  REGRA OPERACIONAL:
+    - O PRIMEIRO robô a subir deve usar share_map:=true (default).
+    - Os demais robôs devem usar share_map:=false.
+  Se dois robôs subirem com share_map:=true ao mesmo tempo, haverá
+  conflito de dois map_servers tentando publicar /map.
+
+ALERTA 3: last_pose_path único entre robôs
+  O argumento last_pose_path tem default /home/arthur/.mjv/last_pose.yaml,
+  que NÃO inclui o namespace. Se múltiplos robôs rodarem na mesma
+  Jetson (caso atípico), um sobrescreverá o checkpoint do outro.
+  Recomendação no docstring do launch: cada robô passar
+  `last_pose_path:=/home/arthur/.mjv/<ns>/last_pose.yaml`.
+  Optou-se por NÃO automatizar essa concatenação para preservar
+  controle explícito do usuário.
+
+ALERTA 4: lifecycle_manager_navigation removido do nav2_params.yaml
+  A seção lifecycle_manager_navigation com node_names hardcoded
+  (robot2/controller_server, etc.) foi REMOVIDA do YAML. O
+  nav2_bringup já cria seu próprio lifecycle manager dentro do
+  namespace, portanto não é necessário.
+  Se alguma rotina externa dependia da configuração antiga,
+  precisará ser ajustada.
+
+ALERTA 5: Pacotes "_teste" são incompatíveis com fluxo legacy
+  Os pacotes _teste agora EXIGEM que o namespace seja informado
+  (default "robot2"). Não é mais possível subir um nó sem
+  namespace e esperar tópicos absolutos como /cmd_vel funcionando
+  como antes. Esta foi uma decisão alinhada com o usuário.
+
+ALERTA 6: Cache de pose / variáveis de ambiente
+  O parâmetro `last_pose_path` aponta para um arquivo no home do
+  usuário arthur. Se o serviço systemd (mjv_bringup.service ou
+  mjv_nav2.service) rodar como outro usuário, esse path precisa ser
+  ajustado.
+
+ALERTA 7: Arquivos temporários em /tmp não são limpos
+  Os launches geram arquivos temporários em /tmp/nav2_<ns>_*.yaml,
+  /tmp/ekf_<ns>_*.yaml, /tmp/amcl_<ns>_*.yaml a cada subida do stack.
+  Esses arquivos são úteis para debug, mas não são removidos
+  automaticamente. Em uso prolongado, considere limpeza periódica
+  (ex: tmpfiles.d ou cron).
+
+ALERTA 8: Diretório de trabalho duplicado
+  Existem dois workspaces no sistema com pacotes de mesmo nome:
+    - /home/arthur/src/ (onde o desenvolvimento foi feito)
+    - /home/arthur/MJV_robot2/ (workspace de produção)
+  Após a tarefa, /home/arthur/MJV_robot2/src/ foi atualizado com a
+  versão refatorada. Se houver builds antigos no install/ ou build/
+  do MJV_robot2, recomenda-se rodar:
+      cd /home/arthur/MJV_robot2 && rm -rf build install log
+      colcon build --symlink-install
+  Para garantir um build limpo.
+
+
+8. COMO USAR — GUIA OPERACIONAL
+--------------------------------------------------------------------------------
+
+8.1. Subindo UM robô (modo single, equivalente ao comportamento antigo):
+    ros2 launch mjv_robot_fleet_base_teste bringup_base.launch.py
+    ros2 launch mjv_robot_fleet_sensors_teste sensors.launch.py
+    ros2 launch mjv_robot_fleet_localization_teste localization.launch.py
+    ros2 launch mjv_robot_fleet_navigation_teste navigation.launch.py
+  (todos pegam default namespace:=robot2)
+
+8.2. Subindo DOIS robôs no mesmo ambiente:
+
+  Robô 1 (PRIMEIRO a subir, leva o map_server compartilhado):
+    ros2 launch mjv_robot_fleet_base_teste bringup_base.launch.py \
+        namespace:=robot1
+    ros2 launch mjv_robot_fleet_sensors_teste sensors.launch.py \
+        namespace:=robot1
+    ros2 launch mjv_robot_fleet_localization_teste localization.launch.py \
+        namespace:=robot1 share_map:=true
+    ros2 launch mjv_robot_fleet_navigation_teste navigation.launch.py \
+        namespace:=robot1
+
+  Robô 2 (SEGUNDO, NÃO sobe map_server de novo):
+    ros2 launch mjv_robot_fleet_base_teste bringup_base.launch.py \
+        namespace:=robot2
+    ros2 launch mjv_robot_fleet_sensors_teste sensors.launch.py \
+        namespace:=robot2
+    ros2 launch mjv_robot_fleet_localization_teste localization.launch.py \
+        namespace:=robot2 share_map:=false
+    ros2 launch mjv_robot_fleet_navigation_teste navigation.launch.py \
+        namespace:=robot2
+
+8.3. Verificações pós-deploy:
+    ros2 topic list | grep robot1   # deve listar tópicos do robot1
+    ros2 topic list | grep robot2   # deve listar tópicos do robot2
+    ros2 action list | grep navigate_to_pose
+        # deve mostrar /robot1/navigate_to_pose e /robot2/navigate_to_pose
+    ros2 run tf2_tools view_frames.py
+        # gera frames.pdf — verificar que existem subárvores robot1/* e
+        # robot2/* sob o frame "map"
+
+8.4. Para enviar uma missão para o robot2:
+    ros2 topic pub /robot2/ui/start_mission std_msgs/msg/String \
+        '{data: "{\"id\": \"poi1\"}"}' --once
+
+8.5. Para enviar comando de teleop manual para o robot1:
+    ros2 topic pub /robot1/ui/manual_cmd geometry_msgs/msg/Twist ...
+
+
+9. PRÓXIMOS PASSOS RECOMENDADOS
+--------------------------------------------------------------------------------
+
+9.1. Testes de hardware (impossível validar sem o robô físico):
+  (a) Subir 1 robô isoladamente com namespace:=robot2 e validar todos
+      os subsistemas (base/odom, sensores/TF, localização/AMCL,
+      navegação/Nav2 + mission_orchestrator).
+  (b) Validar que `ros2 topic list` mostra todos os tópicos prefixados
+      corretamente com /robot2/.
+  (c) Validar TF: `ros2 run tf2_tools view_frames.py` deve mostrar
+      árvore "map -> robot2/odom -> robot2/base_link -> {laser, zed_*}".
+  (d) Subir um SEGUNDO robô (em outra Jetson na mesma rede DDS) com
+      namespace:=robot1 e share_map:=false. Confirmar isolamento total
+      de tópicos e ausência de colisão de frames.
+
+9.2. Ajustes na UI (mjv-ui ou mjv_ui_bridge):
+  - Adicionar conceito de "robô ativo" (dropdown ou parâmetro).
+  - Reescrever todas as publicações/subscrições para incluir o
+    namespace do robô selecionado.
+  - Considerar permitir UI conectada a múltiplos robôs simultaneamente.
+
+9.3. Refatorar o pacote mjv_ui_bridge (FORA DO ESCOPO desta tarefa):
+  - O nó ui_sensors_node é instanciado dentro do namespace pelo
+    sensors.launch.py, mas seu código interno pode estar publicando em
+    tópicos absolutos. PRECISA ser auditado.
+
+9.4. Considerar parâmetros adicionais de personalização por robô:
+  - Footprint diferente por robô (se houver variação física).
+  - Velocidades máximas diferentes.
+  - Mapa próprio por robô (se rodarem em ambientes diferentes).
+
+9.5. Documentação:
+  - Atualizar README do MJV_robot2 com a nova convenção de uso.
+  - Documentar a estratégia de namespace e as decisões arquiteturais
+    (este relatório serve como ponto de partida).
+
+9.6. Limpeza do workspace:
+  - Decidir se os pacotes ORIGINAIS (sem _teste) ainda precisam existir
+    ou se podem ser substituídos pelos _teste.
+  - Remover backups .bak_20260512_relatorio após validação em campo.
+
+9.7. Robustez adicional:
+  - Adicionar tests unitários (pytest) para a função _materialize_*_yaml.
+  - Adicionar argumento `cleanup_tmp` para limpar /tmp antigos.
+  - Considerar se faz sentido adicionar um launch master que sobe os
+    4 stacks (base + sensors + localization + navigation) com um único
+    comando, recebendo apenas namespace e share_map.
+
+
+10. ARQUIVOS DE BACKUP CRIADOS
+--------------------------------------------------------------------------------
+Em /home/arthur/MJV_robot2/src/, antes da cópia dos pacotes refatorados,
+foram criados os seguintes backups (cópia integral dos pacotes antigos):
+
+  mjv_robot_fleet_base_teste.bak_20260512_relatorio
+  mjv_robot_fleet_sensors_teste.bak_20260512_relatorio
+  mjv_robot_fleet_localization_teste.bak_20260512_relatorio
+  mjv_robot_fleet_navigation_teste.bak_20260512_relatorio
+
+Para reverter (rollback completo):
+  cd /home/arthur/MJV_robot2/src
+  for pkg in base sensors localization navigation; do
+    rm -rf mjv_robot_fleet_${pkg}_teste
+    mv mjv_robot_fleet_${pkg}_teste.bak_20260512_relatorio \
+       mjv_robot_fleet_${pkg}_teste
+  done
+
+Para descartar os backups (após validação em campo):
+  rm -rf /home/arthur/MJV_robot2/src/mjv_robot_fleet_*_teste.bak_20260512_relatorio
+
+
+11. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+- 4 pacotes ROS 2 refatorados para suportar operação multi-robô.
+- 14 arquivos modificados (3 YAMLs de config, 5 launch files Python,
+  3 nós Python).
+- 1 bug latente corrigido (localization.launch.py apontava para pacote
+  errado).
+- 1 dependência externa eliminada (nav2_common não é mais necessário).
+- Build colcon valida com sucesso.
+- Validação estática confirma ausência de hardcodes problemáticos.
+- Validação programática confirma que substituição de frames em runtime
+  produz o resultado esperado.
+- Pacotes refatorados copiados para o workspace de produção
+  (/home/arthur/MJV_robot2/src/) com backups criados.
+- Próximo passo crítico: testes em hardware (1 robô primeiro, depois 2).
+- Pendência fora do escopo: ajustes na UI (mjv-ui / mjv_ui_bridge)
+  para contemplar namespaces.
+
+================================================================================
+ADENDO 1 — Correção de paths absolutos (12/Maio/2026)
+================================================================================
+
+Após a entrega inicial, foi identificado que diversos paths absolutos no
+código apontavam para o sistema de desenvolvimento (/home/arthur/...) em
+vez do sistema de produção (Jetson, /home/mjv/...). Isso ocorreu porque
+parte dos paths originais já tinha sido alterada (incorretamente) em
+versões anteriores do código.
+
+A1.1. Paths corrigidos:
+
+  Arquivo: mjv_robot_fleet_base_teste/config/robot_default.yaml
+    Antes: can_dbc: "/home/arthur/src/mjv_robot_fleet_base_teste/odrive-cansimple.dbc"
+    Depois: can_dbc: "/home/mjv/ros2_ws/src/mjv_robot_fleet_base_teste/odrive-cansimple.dbc"
+    Nota: este path é apenas FALLBACK — o launch normalmente sobrescreve
+          com get_package_share_directory(), que aponta pro install/share
+          do pacote instalado. Se o nome do workspace na Jetson for
+          diferente de "ros2_ws", ajustar.
+
+  Arquivo: mjv_robot_fleet_localization_teste/config/amcl_nav2.yaml
+    Antes: yaml_filename: "/home/arthur/maps/Lab_30032026.yaml"
+    Depois: yaml_filename: "/home/mjv/maps/Lab_30032026.yaml"
+
+  Arquivo: mjv_robot_fleet_localization_teste/launch/localization.launch.py
+    Antes: default_value="/home/arthur/.mjv/last_pose.yaml"
+    Depois: default_value="/home/mjv/.mjv/last_pose.yaml"
+
+A1.2. Verificação:
+
+  Após as correções, executou-se grep recursivo nos 4 pacotes para
+  garantir ausência de paths /home/arthur:
+    grep -rn "/home/arthur" /home/arthur/MJV_robot2/src/mjv_robot_fleet_*_teste \
+        --include="*.py" --include="*.yaml" --include="*.json" --include="*.xml" \
+        | grep -v __pycache__ | grep -v ".bak_"
+  Resultado: 0 matches.
+
+
+================================================================================
+ADENDO 2 — Frames TF da câmera ZED (12/Maio/2026)
+================================================================================
+
+A2.1. Problema relatado pelo usuário:
+
+  Após a refatoração inicial, ao mudar o nome dos tópicos e frames no
+  launch da câmera ZED, alguns frames internos da ZED (por exemplo
+  camera_link_left, camera_link_right) ficavam "ocultos" ou inacessíveis
+  na árvore TF. O usuário não conseguia referenciá-los no namespace
+  pretendido.
+
+A2.2. Diagnóstico:
+
+  Análise do código fonte do zed-ros2-wrapper revelou que o pacote
+  constrói TODOS os seus frames TF internos a partir de UM ÚNICO
+  parâmetro: `camera_name`. Veja função setTFCoordFrameNames() em:
+    zed_components/src/zed_camera/src/zed_camera_component_main.cpp:1985
+
+    mCenterFrameId      = mCameraName + "_camera_center";
+    mLeftCamFrameId     = mCameraName + "_left_camera_frame";
+    mLeftCamOptFrameId  = mCameraName + "_left_camera_frame_optical";
+    mRightCamFrameId    = mCameraName + "_right_camera_frame";
+    mRightCamOptFrameId = mCameraName + "_right_camera_frame_optical";
+    mImuFrameId         = mCameraName + "_imu_link";
+    mBaroFrameId        = mCenterFrameId;
+    mMagFrameId         = mImuFrameId;
+    mDepthFrameId       = mLeftCamFrameId;
+    mPointCloudFrameId  = mDepthFrameId;
+    ...
+
+  Pontos críticos:
+  (a) Frames TF são strings GLOBAIS no ROS 2 — diferente de tópicos,
+      eles NÃO recebem prefixo automático do namespace ROS 2.
+  (b) Com camera_name="zed2" hardcoded (default no launch antigo),
+      múltiplos robôs publicariam frames com nomes IDÊNTICOS, causando
+      colisão silenciosa na árvore TF (último a publicar vence).
+  (c) Os TFs estáticos artificiais que existiam no launch
+      (`zed_camera_link`, `zed_imu_link`) não correspondiam aos nomes
+      reais publicados pelo ZED, criando frames ÓRFÃOS na árvore.
+
+A2.3. Solução adotada:
+
+  (a) Tornar `camera_name` DINÂMICO com base no namespace e modelo:
+        camera_name_str = [namespace, "_", camera_model]
+      Para namespace="robot2" e camera_model="zed2", o ZED passa a
+      publicar frames com prefixo único:
+        robot2_zed2_camera_center
+        robot2_zed2_left_camera_frame
+        robot2_zed2_left_camera_frame_optical
+        robot2_zed2_right_camera_frame
+        robot2_zed2_right_camera_frame_optical
+        robot2_zed2_imu_link
+
+  (b) Ajustar o TF estático que conecta o robô à câmera para apontar
+      para o frame raiz REAL publicado pelo ZED:
+        TF: <ns>/base_link -> <ns>_<modelo>_camera_center
+      A partir desse frame raiz, o próprio nó ZED publica TFs internas
+      (camera_center -> left, right, imu) com calibração correta.
+
+  (c) Ativar `publish_imu_tf=true` (estava false) para que o ZED
+      publique sozinho a TF camera_center -> imu_link com calibração
+      interna, em vez de mantermos um TF estático artificial.
+
+  (d) REMOVER os TFs estáticos artificiais zed_camera_link e
+      zed_imu_link, que eram offsets zero e desconectados dos frames
+      reais da ZED.
+
+A2.4. Árvore TF resultante (exemplo robot2):
+
+  map  (compartilhado entre robôs)
+   └─ robot2/odom  (publicado pelo EKF/AMCL)
+       └─ robot2/base_link  (publicado pelo EKF)
+           ├─ robot2/laser  (TF estático, sensors.launch.py)
+           └─ robot2_zed2_camera_center  (TF estático, sensors.launch.py)
+               ├─ robot2_zed2_left_camera_frame  (publicado pelo ZED)
+               │   └─ robot2_zed2_left_camera_frame_optical  (ZED)
+               ├─ robot2_zed2_right_camera_frame  (publicado pelo ZED)
+               │   └─ robot2_zed2_right_camera_frame_optical  (ZED)
+               └─ robot2_zed2_imu_link  (publicado pelo ZED)
+
+  Para um segundo robô (robot1), a estrutura é simétrica e independente,
+  com prefixo "robot1" — sem colisão de frames.
+
+A2.5. Trade-off / convenção mista:
+
+  Frames do robô usam BARRA: robot2/base_link, robot2/odom, robot2/laser
+  Frames da ZED usam UNDERSCORE: robot2_zed2_left_camera_frame, etc.
+
+  Isso é uma limitação imposta pelo wrapper da ZED (caixa preta), que
+  não aceita prefixo de namespace ROS 2 nem permite caracteres especiais
+  como "/" no camera_name. Para forçar barras, seria necessário
+  recompilar o wrapper modificando setTFCoordFrameNames(), o que está
+  fora do escopo desta tarefa e quebraria a manutenibilidade.
+
+  Impacto prático: nós DOWNSTREAM que referenciam frames da ZED (RViz,
+  processamento de imagem, etc.) precisam usar EXATAMENTE os novos
+  nomes. Por exemplo, em RViz, ao adicionar uma exibição de Image,
+  selecionar topic /robot2/zed/left/image_rect_color (com namespace) e
+  o frame de referência correspondente robot2_zed2_left_camera_frame.
+
+A2.6. Erro encontrado durante implementação:
+
+  Tentativa inicial:
+    zed_root_frame = [camera_name_str, "_camera_center"]
+  onde camera_name_str = [namespace, "_", camera_model]
+
+  Resultado: erro do launch — "list within list" não é aceito pela
+  função normalize_to_list_of_substitutions do ROS 2 launch system.
+
+  Correção: achatar manualmente em uma única lista de substitutions:
+    zed_root_frame = [namespace, "_", camera_model, "_camera_center"]
+
+A2.7. Validação:
+
+  - Build: colcon build --packages-select mjv_robot_fleet_sensors_teste
+    finalizou em 0.84s sem erros.
+  - Smoke test: ros2 launch ... --show-args lista os argumentos
+    declarados (camera_model, namespace, lidar_serial_port) corretamente.
+  - Validação em hardware: PENDENTE (requer câmera ZED conectada).
+
+A2.8. Pontos a validar em campo (ZED):
+
+  Após subir o stack com a câmera conectada, verificar:
+  1. ros2 topic list | grep robot2/zed deve listar:
+       /robot2/zed/odom
+       /robot2/zed/imu/data
+       /robot2/zed/left/image_rect_color
+       /robot2/zed/right/image_rect_color
+       (etc.)
+  2. ros2 run tf2_tools view_frames.py deve mostrar a árvore TF
+     conforme A2.4, sem frames órfãos.
+  3. RViz: configurar Fixed Frame como "map" e adicionar exibição de
+     Image apontando para frame robot2_zed2_left_camera_frame.
+
+
+================================================================================
+FIM DO RELATÓRIO
+================================================================================
