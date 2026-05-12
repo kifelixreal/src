@@ -1,0 +1,26 @@
+ros__parameters:
+  tf_static_delay: 15.0
+
+  zed:
+    camera_model: "zed2i"
+    use_container: false
+    publish_tf: false
+    publish_map_tf: false
+
+  laser_tf:
+    parent_frame: "base_link"
+    child_frame: "laser"
+    xyz: [0.18, 0.0, 0.24]
+    rpy: [0.0, 0.0, 0.0]
+
+  zed_cam_tf:
+    parent_frame: "base_link"
+    child_frame: "zed_camera_link"
+    xyz: [0.18, 0.0, 0.25]
+    rpy: [0.0, 0.0, 0.0]
+
+  zed_imu_tf:
+    parent_frame: "zed_camera_link"
+    child_frame: "zed_imu_link"
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]

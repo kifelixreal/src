@@ -1,0 +1,31 @@
+# Configuração padrão dos sensores.
+#
+# Os FRAMES TF e o CAMERA_NAME são construídos no launch a partir do
+# namespace e do camera_model (ex: namespace=robot2 + camera_model=zed2
+# gera camera_name="robot2_zed2" e frames como robot2_zed2_left_camera_frame).
+# Por isso este YAML não contém prefixos de robô.
+
+/**:
+  ros__parameters:
+    tf_static_delay: 15.0
+
+    zed:
+      camera_model: "zed2"
+      use_container: false
+      publish_tf: false        # EKF/AMCL fazem map/odom -> base
+      publish_map_tf: false
+      publish_imu_tf: true     # ZED publica camera_center -> imu_link
+
+    # Offset físico do LiDAR em relação a <ns>/base_link.
+    # O launch usa esses valores nos arguments do static_transform_publisher.
+    laser_tf:
+      xyz: [0.18, 0.0, 0.24]
+      rpy: [0.0, 0.0, 0.0]
+
+    # Offset físico do conjunto da câmera ZED em relação a <ns>/base_link.
+    # Conecta <ns>/base_link -> <ns>_<modelo>_camera_center, que é o frame
+    # raiz interno do ZED. A partir dele o próprio nó ZED publica os
+    # frames _left_camera_frame, _right_camera_frame, _imu_link, etc.
+    zed_cam_tf:
+      xyz: [0.18, 0.0, 0.25]
+      rpy: [0.0, 0.0, 0.0]
